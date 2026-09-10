@@ -1,6 +1,7 @@
 import { Apple, decodeIdToken, Google, generateCodeVerifier, generateState } from 'arctic';
 import { Hono } from 'hono';
 import { HttpError, isAdminLogin, requireUser } from '../lib/auth.js';
+import { deliverSession, exchangeAuthCode } from '../lib/deliver-session.js';
 import { isLikelyEmail, normalizeEmail, sendEmail } from '../lib/email.js';
 import { isAllowedReturnTo } from '../lib/origins.js';
 import { signPayload, signSession, verifyPayload } from '../lib/session.js';
@@ -10,6 +11,7 @@ interface OAuthState {
   appId: string;
   returnTo: string;
   responseMode?: string;
+  codeChallenge?: string;
   exp: number;
 }
 
@@ -18,6 +20,7 @@ interface GoogleOAuthState {
   returnTo: string;
   codeVerifier: string;
   responseMode?: string;
+  codeChallenge?: string;
   exp: number;
 }
 
@@ -25,6 +28,7 @@ interface AppleOAuthState {
   appId: string;
   returnTo: string;
   responseMode?: string;
+  codeChallenge?: string;
   exp: number;
 }
 
@@ -33,7 +37,28 @@ interface EmailMagicState {
   appId: string;
   returnTo: string;
   responseMode?: string;
+  codeChallenge?: string;
   exp: number;
+}
+
+/**
+ * Validate the PKCE parameters on a /start request. Only `response_mode=code`
+ * uses them, and for that mode they are mandatory — a code-mode flow started
+ * without a challenge would have nothing binding the eventual code to its
+ * initiator, so it is rejected here rather than at the callback (by which
+ * point the user has already been through the provider).
+ */
+function readCodeChallenge(
+  responseMode: string | undefined,
+  codeChallenge: string | undefined,
+  method: string | undefined,
+): { ok: true; codeChallenge?: string } | { ok: false; error: string } {
+  if (responseMode !== 'code') return { ok: true };
+  if (!codeChallenge) return { ok: false, error: 'response_mode=code requires code_challenge' };
+  if (method && method !== 'S256') {
+    return { ok: false, error: 'code_challenge_method must be S256' };
+  }
+  return { ok: true, codeChallenge };
 }
 
 const STATE_TTL_SECONDS = 10 * 60;
@@ -53,12 +78,19 @@ authRoutes.get('/auth/github/start', async (c) => {
   const responseMode = c.req.query('response_mode');
   if (!appId || !returnTo) return c.text('missing app_id or return_to', 400);
   if (!isAllowedReturnTo(returnTo, appId)) return c.text('return_to not allowed', 400);
+  const pkce = readCodeChallenge(
+    responseMode,
+    c.req.query('code_challenge'),
+    c.req.query('code_challenge_method'),
+  );
+  if (!pkce.ok) return c.text(pkce.error, 400);
 
   const state = await signPayload<OAuthState>(
     {
       appId,
       returnTo,
       ...(responseMode ? { responseMode } : {}),
+      ...(pkce.codeChallenge ? { codeChallenge: pkce.codeChallenge } : {}),
       exp: Math.floor(Date.now() / 1000) + STATE_TTL_SECONDS,
     },
     c.env.SESSION_SIGNING_KEY,
@@ -120,13 +152,9 @@ authRoutes.get('/auth/github/callback', async (c) => {
 
   const { roles, appRoles } = await computeRoles(userId, ghUser.login, c.env);
   const session = await signSession(userId, c.env.SESSION_SIGNING_KEY, { roles, appRoles });
-  const redirect = new URL(state.returnTo);
-  if (state.responseMode === 'query') {
-    redirect.searchParams.set('fas_session', session);
-  } else {
-    redirect.hash = `fas_session=${encodeURIComponent(session)}`;
-  }
-  return c.redirect(redirect.toString());
+  const delivery = await deliverSession(c.env, state, session);
+  if (!delivery.ok) return c.text(delivery.error, 400);
+  return c.redirect(delivery.url);
 });
 
 authRoutes.get('/auth/google/start', async (c) => {
@@ -135,6 +163,12 @@ authRoutes.get('/auth/google/start', async (c) => {
   const responseMode = c.req.query('response_mode');
   if (!appId || !returnTo) return c.text('missing app_id or return_to', 400);
   if (!isAllowedReturnTo(returnTo, appId)) return c.text('return_to not allowed', 400);
+  const pkce = readCodeChallenge(
+    responseMode,
+    c.req.query('code_challenge'),
+    c.req.query('code_challenge_method'),
+  );
+  if (!pkce.ok) return c.text(pkce.error, 400);
 
   if (!c.env.GOOGLE_CLIENT_ID || !c.env.GOOGLE_CLIENT_SECRET) {
     return c.text('Google OAuth not configured', 503);
@@ -152,6 +186,7 @@ authRoutes.get('/auth/google/start', async (c) => {
       returnTo,
       codeVerifier,
       ...(responseMode ? { responseMode } : {}),
+      ...(pkce.codeChallenge ? { codeChallenge: pkce.codeChallenge } : {}),
       exp: Math.floor(Date.now() / 1000) + STATE_TTL_SECONDS,
     },
     c.env.SESSION_SIGNING_KEY,
@@ -216,13 +251,9 @@ authRoutes.get('/auth/google/callback', async (c) => {
 
     const { roles, appRoles } = await computeRoles(userId, login, c.env, 'google');
     const session = await signSession(userId, c.env.SESSION_SIGNING_KEY, { roles, appRoles });
-    const redirect = new URL(state.returnTo);
-    if (state.responseMode === 'query') {
-      redirect.searchParams.set('fas_session', session);
-    } else {
-      redirect.hash = `fas_session=${encodeURIComponent(session)}`;
-    }
-    return c.redirect(redirect.toString());
+    const delivery = await deliverSession(c.env, state, session);
+    if (!delivery.ok) return c.text(delivery.error, 400);
+    return c.redirect(delivery.url);
   } catch (err) {
     console.error('Google OAuth callback error:', err);
     return c.text(
@@ -242,6 +273,12 @@ authRoutes.get('/auth/apple/start', async (c) => {
   const responseMode = c.req.query('response_mode');
   if (!appId || !returnTo) return c.text('missing app_id or return_to', 400);
   if (!isAllowedReturnTo(returnTo, appId)) return c.text('return_to not allowed', 400);
+  const pkce = readCodeChallenge(
+    responseMode,
+    c.req.query('code_challenge'),
+    c.req.query('code_challenge_method'),
+  );
+  if (!pkce.ok) return c.text(pkce.error, 400);
 
   if (
     !c.env.APPLE_CLIENT_ID ||
@@ -267,6 +304,7 @@ authRoutes.get('/auth/apple/start', async (c) => {
       appId,
       returnTo,
       ...(responseMode ? { responseMode } : {}),
+      ...(pkce.codeChallenge ? { codeChallenge: pkce.codeChallenge } : {}),
       exp: Math.floor(Date.now() / 1000) + STATE_TTL_SECONDS,
     },
     c.env.SESSION_SIGNING_KEY,
@@ -349,13 +387,9 @@ authRoutes.post('/auth/apple/callback', async (c) => {
 
     const { roles, appRoles } = await computeRoles(userId, login, c.env, 'apple');
     const session = await signSession(userId, c.env.SESSION_SIGNING_KEY, { roles, appRoles });
-    const redirect = new URL(state.returnTo);
-    if (state.responseMode === 'query') {
-      redirect.searchParams.set('fas_session', session);
-    } else {
-      redirect.hash = `fas_session=${encodeURIComponent(session)}`;
-    }
-    return c.redirect(redirect.toString());
+    const delivery = await deliverSession(c.env, state, session);
+    if (!delivery.ok) return c.text(delivery.error, 400);
+    return c.redirect(delivery.url);
   } catch (err) {
     console.error('Apple OAuth callback error:', err);
     return c.text(
@@ -375,16 +409,22 @@ authRoutes.post('/auth/email/start', async (c) => {
     appId,
     returnTo,
     responseMode,
+    codeChallenge: rawCodeChallenge,
+    codeChallengeMethod,
   } = await c.req.json<{
     email?: string;
     appId?: string;
     returnTo?: string;
     responseMode?: string;
+    codeChallenge?: string;
+    codeChallengeMethod?: string;
   }>();
 
   if (!rawEmail || !appId || !returnTo) {
     return c.text('missing email, appId, or returnTo', 400);
   }
+  const pkce = readCodeChallenge(responseMode, rawCodeChallenge, codeChallengeMethod);
+  if (!pkce.ok) return c.text(pkce.error, 400);
   // Normalize first (trim + lowercase) so UI-side whitespace doesn't reject
   // valid addresses; then validate the canonical form.
   const email = normalizeEmail(rawEmail);
@@ -411,6 +451,7 @@ authRoutes.post('/auth/email/start', async (c) => {
       appId,
       returnTo,
       ...(responseMode ? { responseMode } : {}),
+      ...(pkce.codeChallenge ? { codeChallenge: pkce.codeChallenge } : {}),
       exp: Math.floor(Date.now() / 1000) + MAGIC_LINK_TTL_SECONDS,
     },
     c.env.SESSION_SIGNING_KEY,
@@ -479,13 +520,31 @@ authRoutes.get('/auth/email/callback', async (c) => {
 
   const { roles, appRoles } = await computeRoles(userId, login, c.env, 'email');
   const session = await signSession(userId, c.env.SESSION_SIGNING_KEY, { roles, appRoles });
-  const redirect = new URL(state.returnTo);
-  if (state.responseMode === 'query') {
-    redirect.searchParams.set('fas_session', session);
-  } else {
-    redirect.hash = `fas_session=${encodeURIComponent(session)}`;
+  const delivery = await deliverSession(c.env, state, session);
+  if (!delivery.ok) return c.text(delivery.error, 400);
+  return c.redirect(delivery.url);
+});
+
+/**
+ * Trade a one-time code from `response_mode=code` for the session token.
+ *
+ * Deliberately unauthenticated: the caller has no session yet — that is the
+ * whole point of the exchange. The PKCE verifier is the credential, and the
+ * code is single-use, so possession of the code alone (from a redirect log,
+ * say) gets you nothing.
+ */
+authRoutes.post('/auth/session/exchange', async (c) => {
+  const body = await c.req
+    .json<{ code?: string; code_verifier?: string }>()
+    .catch(() => ({}) as { code?: string; code_verifier?: string });
+  if (!body.code || !body.code_verifier) {
+    return c.json({ error: 'missing code or code_verifier' }, 400);
   }
-  return c.redirect(redirect.toString());
+  const session = await exchangeAuthCode(c.env, body.code, body.code_verifier);
+  // One message for every failure mode — expired, already-redeemed and
+  // wrong-verifier are not distinguished, so the endpoint isn't an oracle.
+  if (!session) return c.json({ error: 'invalid, expired, or already-used code' }, 400);
+  return c.json({ fas_session: session });
 });
 
 authRoutes.get('/auth/me', async (c) => {

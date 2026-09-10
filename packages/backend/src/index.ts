@@ -128,6 +128,12 @@ export default {
         .bind(nowEpoch)
         .run()
         .catch(() => {});
+      // Prune expired one-time auth codes. Redemption deletes them, so these
+      // are the abandoned flows — rows here still hold a live session token.
+      await env.DB.prepare('DELETE FROM auth_codes WHERE expires_at < ?')
+        .bind(nowEpoch)
+        .run()
+        .catch(() => {});
     } else if (event.cron === '0 6 * * SUN') {
       // Weekly compliance audit — Sunday 06:00 UTC. Logs the totals
       // so a missed audit is obvious in `wrangler tail`.
